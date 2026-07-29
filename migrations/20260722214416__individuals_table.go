@@ -11,7 +11,7 @@ const createIndividualsTable = `CREATE TABLE IF NOT EXISTS individuals (
     h_id int NOT NULL ,
     m_id int NOT NULL ,
     r_id int NOT NULL ,
-    address_id int NOT NULL REFERENCES addresses(id),
+    address_id int NOT NULL,
     email varchar(100) unique default null,
     profession_id int NOT NULL REFERENCES professions(id),
     profession_status int NOT NULL,

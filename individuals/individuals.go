@@ -31,17 +31,22 @@ func scanIndividual(row rowScanner) (*models.IndividualResponse, error) {
 		resp                     models.IndividualResponse
 		phone, email, img        sql.NullString
 		lastMetAt                sql.NullTime
+		metaData                 []byte
 		hID, mID, rID, addressID int
 	)
 
 	err := row.Scan(
-		&resp.Id, &resp.Name, &phone, &email, &resp.ProfessionStatus, &img, &resp.MetaData,
+		&resp.Id, &resp.Name, &phone, &email, &resp.ProfessionStatus, &img, &metaData,
 		&resp.CreatedAt, &resp.UpdatedAt, &lastMetAt,
 		&hID, &mID, &rID, &addressID,
 		&resp.Profession.Id, &resp.Profession.Name,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if metaData != nil {
+		resp.MetaData = metaData
 	}
 
 	resp.Halqa = halqas[hID]

@@ -15,17 +15,10 @@ const selectIndividualQuery = `
 SELECT
     i.id, i.name, i.phone, i.email, i.profession_status, i.img, i.meta_data,
     i.created_at, i.updated_at, i.last_met_at,
-    h.id, h.name,
-    m.id, m.name,
-    r.id, r.name,
-    p.id, p.name,
-    a.id, a.road_id, a.door_no, a.landmark, a.city, a.state, a.pincode, a.country, a.latitude, a.longitude
+    i.h_id, i.m_id, i.r_id, i.address_id,
+    p.id, p.name
 FROM individuals i
-JOIN halqas h ON h.id = i.h_id
-JOIN masjids m ON m.id = i.m_id
-JOIN roads r ON r.id = i.r_id
 JOIN professions p ON p.id = i.profession_id
-JOIN addresses a ON a.id = i.address_id
 WHERE i.deleted_at IS NULL`
 
 // rowScanner is implemented by both *sql.Row and *sql.Rows.
@@ -35,27 +28,26 @@ type rowScanner interface {
 
 func scanIndividual(row rowScanner) (*models.IndividualResponse, error) {
 	var (
-		resp                models.IndividualResponse
-		phone, email, img   sql.NullString
-		lastMetAt           sql.NullTime
-		doorNo, landmark    sql.NullString
-		pincode             sql.NullString
-		latitude, longitude sql.NullFloat64
+		resp                     models.IndividualResponse
+		phone, email, img        sql.NullString
+		lastMetAt                sql.NullTime
+		hID, mID, rID, addressID int
 	)
 
 	err := row.Scan(
 		&resp.Id, &resp.Name, &phone, &email, &resp.ProfessionStatus, &img, &resp.MetaData,
 		&resp.CreatedAt, &resp.UpdatedAt, &lastMetAt,
-		&resp.Halqa.Id, &resp.Halqa.Name,
-		&resp.Masjid.Id, &resp.Masjid.Name,
-		&resp.Road.Id, &resp.Road.Name,
+		&hID, &mID, &rID, &addressID,
 		&resp.Profession.Id, &resp.Profession.Name,
-		&resp.Address.Id, &resp.Address.RoadId, &doorNo, &landmark, &resp.Address.City, &resp.Address.State,
-		&pincode, &resp.Address.Country, &latitude, &longitude,
 	)
 	if err != nil {
 		return nil, err
 	}
+
+	resp.Halqa = halqas[hID]
+	resp.Masjid = masjids[mID]
+	resp.Road = roads[rID]
+	resp.Address = addresses[addressID]
 
 	if phone.Valid {
 		resp.Phone = &phone.String
@@ -71,26 +63,6 @@ func scanIndividual(row rowScanner) (*models.IndividualResponse, error) {
 
 	if lastMetAt.Valid {
 		resp.LastMetAt = &lastMetAt.Time
-	}
-
-	if doorNo.Valid {
-		resp.Address.DoorNo = &doorNo.String
-	}
-
-	if landmark.Valid {
-		resp.Address.Landmark = &landmark.String
-	}
-
-	if pincode.Valid {
-		resp.Address.Pincode = &pincode.String
-	}
-
-	if latitude.Valid {
-		resp.Address.Latitude = &latitude.Float64
-	}
-
-	if longitude.Valid {
-		resp.Address.Longitude = &longitude.Float64
 	}
 
 	return &resp, nil
@@ -111,7 +83,7 @@ func getIndividualByID(c *gofr.Context, id string) (*models.IndividualResponse, 
 	return resp, nil
 }
 
-var fkColumns = []string{"h_id", "m_id", "r_id", "address_id", "profession_id"}
+var fkColumns = []string{"profession_id"}
 
 func mapSQLError(err error) error {
 	msg := strings.ToLower(err.Error())
@@ -126,10 +98,38 @@ func mapSQLError(err error) error {
 			}
 		}
 
-		return gofrHTTP.ErrorInvalidParam{Params: []string{"h_id, m_id, r_id, address_id or profession_id"}}
+		return gofrHTTP.ErrorInvalidParam{Params: []string{"profession_id"}}
 	default:
 		return err
 	}
+}
+
+// validateReferenceIDs checks h_id, m_id, r_id and address_id against the
+// static reference data, since those don't have real tables/FK constraints yet.
+func validateReferenceIDs(req *models.IndividualRequest) error {
+	var invalid []string
+
+	if _, ok := halqas[req.HId]; !ok {
+		invalid = append(invalid, "h_id")
+	}
+
+	if _, ok := masjids[req.MId]; !ok {
+		invalid = append(invalid, "m_id")
+	}
+
+	if _, ok := roads[req.RId]; !ok {
+		invalid = append(invalid, "r_id")
+	}
+
+	if _, ok := addresses[req.AddressId]; !ok {
+		invalid = append(invalid, "address_id")
+	}
+
+	if len(invalid) > 0 {
+		return gofrHTTP.ErrorInvalidParam{Params: invalid}
+	}
+
+	return nil
 }
 
 func Create(c *gofr.Context) (any, error) {
@@ -141,6 +141,10 @@ func Create(c *gofr.Context) (any, error) {
 
 	if req.Name == "" {
 		return nil, gofrHTTP.ErrorMissingParam{Params: []string{"name"}}
+	}
+
+	if err := validateReferenceIDs(&req); err != nil {
+		return nil, err
 	}
 
 	const insertQuery = `
@@ -202,6 +206,10 @@ func Update(c *gofr.Context) (any, error) {
 
 	if req.Name == "" {
 		return nil, gofrHTTP.ErrorMissingParam{Params: []string{"name"}}
+	}
+
+	if err := validateReferenceIDs(&req); err != nil {
+		return nil, err
 	}
 
 	const updateQuery = `

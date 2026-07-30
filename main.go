@@ -11,6 +11,8 @@ import (
 func main() {
 	app := gofr.New()
 
+	app.AddHTTPService("account-service", app.Config.GetOrDefault("ACCOUNT_SERVICE", "https://account-service-app.onrender.com"))
+
 	app.Migrate(migrations.All())
 
 	professions.RegisterRoutes(app)

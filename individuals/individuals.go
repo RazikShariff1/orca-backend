@@ -2,8 +2,10 @@ package individuals
 
 import (
 	"database/sql"
+	"errors"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gofr.dev/pkg/gofr"
 	gofrHTTP "gofr.dev/pkg/gofr/http"
@@ -28,17 +30,16 @@ type rowScanner interface {
 
 func scanIndividual(row rowScanner) (*models.IndividualResponse, error) {
 	var (
-		resp                     models.IndividualResponse
-		phone, email, img        sql.NullString
-		lastMetAt                sql.NullTime
-		metaData                 []byte
-		hID, mID, rID, addressID int
+		resp              models.IndividualResponse
+		phone, email, img sql.NullString
+		lastMetAt         sql.NullTime
+		metaData          []byte
 	)
 
 	err := row.Scan(
 		&resp.Id, &resp.Name, &phone, &email, &resp.ProfessionStatus, &img, &metaData,
 		&resp.CreatedAt, &resp.UpdatedAt, &lastMetAt,
-		&hID, &mID, &rID, &addressID,
+		&resp.Halqa.Id, &resp.Masjid.Id, &resp.Road.Id, &resp.Address.Id,
 		&resp.Profession.Id, &resp.Profession.Name,
 	)
 	if err != nil {
@@ -48,11 +49,6 @@ func scanIndividual(row rowScanner) (*models.IndividualResponse, error) {
 	if metaData != nil {
 		resp.MetaData = metaData
 	}
-
-	resp.Halqa = halqas[hID]
-	resp.Masjid = masjids[mID]
-	resp.Road = roads[rID]
-	resp.Address = addresses[addressID]
 
 	if phone.Valid {
 		resp.Phone = &phone.String
@@ -85,6 +81,10 @@ func getIndividualByID(c *gofr.Context, id string) (*models.IndividualResponse, 
 		return nil, err
 	}
 
+	if err := enrichIndividual(c, resp); err != nil {
+		return nil, err
+	}
+
 	return resp, nil
 }
 
@@ -109,25 +109,52 @@ func mapSQLError(err error) error {
 	}
 }
 
-// validateReferenceIDs checks h_id, m_id, r_id and address_id against the
-// static reference data, since those don't have real tables/FK constraints yet.
-func validateReferenceIDs(req *models.IndividualRequest) error {
-	var invalid []string
-
-	if _, ok := halqas[req.HId]; !ok {
-		invalid = append(invalid, "h_id")
+// validateReferenceIDs checks h_id, m_id, r_id and address_id against
+// account-service, since individuals only stores the ids.
+func validateReferenceIDs(c *gofr.Context, req *models.IndividualRequest) error {
+	checks := []struct {
+		field string
+		fetch func() error
+	}{
+		{"h_id", func() error { _, err := fetchHalqa(c, req.HId); return err }},
+		{"m_id", func() error { _, err := fetchMasjid(c, req.MId); return err }},
+		{"r_id", func() error { _, err := fetchRoad(c, req.RId); return err }},
+		{"address_id", func() error { _, err := fetchAddress(c, req.AddressId); return err }},
 	}
 
-	if _, ok := masjids[req.MId]; !ok {
-		invalid = append(invalid, "m_id")
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		invalid []string
+		errs    []error
+	)
+
+	wg.Add(len(checks))
+
+	for _, chk := range checks {
+		go func(field string, fetch func() error) {
+			defer wg.Done()
+
+			err := fetch()
+			if err == nil {
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if errors.Is(err, errAccountServiceNotFound) {
+				invalid = append(invalid, field)
+			} else {
+				errs = append(errs, err)
+			}
+		}(chk.field, chk.fetch)
 	}
 
-	if _, ok := roads[req.RId]; !ok {
-		invalid = append(invalid, "r_id")
-	}
+	wg.Wait()
 
-	if _, ok := addresses[req.AddressId]; !ok {
-		invalid = append(invalid, "address_id")
+	if len(errs) > 0 {
+		return errs[0]
 	}
 
 	if len(invalid) > 0 {
@@ -144,11 +171,7 @@ func Create(c *gofr.Context) (any, error) {
 		return nil, err
 	}
 
-	if req.Name == "" {
-		return nil, gofrHTTP.ErrorMissingParam{Params: []string{"name"}}
-	}
-
-	if err := validateReferenceIDs(&req); err != nil {
+	if err := validate(c, &req); err != nil {
 		return nil, err
 	}
 
@@ -170,6 +193,26 @@ RETURNING id`
 	return getIndividualByID(c, strconv.Itoa(id))
 }
 
+func validate(c *gofr.Context, req *models.IndividualRequest) error {
+	if req.Name == "" {
+		return gofrHTTP.ErrorMissingParam{Params: []string{"name"}}
+	}
+
+	if len(req.Name) < 5 {
+		return gofrHTTP.ErrorInvalidParam{Params: []string{"name"}}
+	}
+
+	if req.Phone != nil && (len(*req.Phone) < 1 || len(*req.Phone) > 10) {
+		return gofrHTTP.ErrorInvalidParam{Params: []string{"phone"}}
+	}
+
+	if req.Email != nil && *req.Email == "" {
+		return gofrHTTP.ErrorInvalidParam{Params: []string{"email"}}
+	}
+
+	return validateReferenceIDs(c, req)
+}
+
 // GetAll returns every individual that has not been soft-deleted.
 func GetAll(c *gofr.Context) (any, error) {
 	rows, err := c.SQL.QueryContext(c, selectIndividualQuery+" ORDER BY i.id")
@@ -186,6 +229,10 @@ func GetAll(c *gofr.Context) (any, error) {
 			return nil, err
 		}
 
+		if err := enrichIndividual(c, individual); err != nil {
+			return nil, err
+		}
+
 		individuals = append(individuals, individual)
 	}
 
@@ -195,6 +242,14 @@ func GetAll(c *gofr.Context) (any, error) {
 // Get returns a single individual by id.
 func Get(c *gofr.Context) (any, error) {
 	id := c.PathParam("id")
+
+	if id == "" {
+		return nil, gofrHTTP.ErrorMissingParam{Params: []string{"id"}}
+	}
+
+	if idInt, err := strconv.Atoi(id); err != nil || idInt < 0 {
+		return nil, gofrHTTP.ErrorInvalidParam{Params: []string{"id"}}
+	}
 
 	return getIndividualByID(c, id)
 }
@@ -209,11 +264,7 @@ func Update(c *gofr.Context) (any, error) {
 		return nil, err
 	}
 
-	if req.Name == "" {
-		return nil, gofrHTTP.ErrorMissingParam{Params: []string{"name"}}
-	}
-
-	if err := validateReferenceIDs(&req); err != nil {
+	if err := validate(c, &req); err != nil {
 		return nil, err
 	}
 

@@ -62,7 +62,7 @@ type Profession struct {
 
 type Address struct {
 	Id        int      `json:"id"`
-	RoadId    int      `json:"road_id"`
+	Road      Road     `json:"road"`
 	DoorNo    *string  `json:"door_no"`
 	Landmark  *string  `json:"landmark"`
 	City      string   `json:"city"`
